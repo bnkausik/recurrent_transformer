@@ -74,8 +74,7 @@ dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported
 compile = True # use PyTorch 2.0 to compile the model to be faster
 
 #additional parameters
-n_shard = 1 #number of shards
-r_ratio = 1 #embed rank reduction ratio
+summary_points = 0 # attention points for summary; if zero, no summary
 
 
 
@@ -152,7 +151,7 @@ if os.path.exists(meta_path):
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  n_shard=n_shard,r_ratio=r_ratio,    # additional parameters for sharding and low-rank embedding
+                  summary_points=summary_points, # additional parameters for summary
                   bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
@@ -272,7 +271,7 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        print(f"iter {iter_num} tokens {iter_num*block_size*batch_size/1e6} train loss {losses['train']:.4f} val loss {losses['val']:.4f}")
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
@@ -281,7 +280,8 @@ while True:
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             })
-        if losses['val'] < best_val_loss or always_save_checkpoint:
+        #if losses['val'] < best_val_loss or always_save_checkpoint:
+        if iter_num == max_iters:  #tweak
             best_val_loss = losses['val']
             if iter_num > 0:
                 checkpoint = {

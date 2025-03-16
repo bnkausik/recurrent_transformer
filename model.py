@@ -8,6 +8,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 """
 
 import math
+import numpy as np
 import inspect
 from dataclasses import dataclass
 import torch
@@ -35,12 +36,10 @@ class CausalSelfAttention(nn.Module):
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
-        #self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        #self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         # regularization
-        self.attn_dropout = nn.Dropout(config.dropout)
+        #self.attn_dropout = nn.Dropout(config.dropout)  # not req'd with sdpa
         self.resid_dropout = nn.Dropout(config.dropout)
         self.n_head = config.n_head
         self.n_embd = config.n_embd
@@ -52,20 +51,18 @@ class CausalSelfAttention(nn.Module):
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
-        # tweaks for dithering instead of dropout
-        if self.training:
-            t_x = torch.randperm(k.size(-1))[0:int(k.size(-1)/2)]; k=k[...,t_x]; q=q[...,t_x]
-        k=k.to(dtype = torch.float16); q=q.to(dtype = torch.float16); v=v.to(dtype = torch.float16)
-        # end dithering tweaks
+        q=q.to(dtype = torch.float16); k=k.to(dtype = torch.float16); v=v.to(dtype = torch.float16)
+        d_p = self.dropout if self.training else 0
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         #with sdpa_kernel([SDPBackend.MATH, SDPBackend.EFFICIENT_ATTENTION]):
+        # dropout set to 1e-8 always to force spda to accept dim_v different from dim_q
         with sdpa_kernel([SDPBackend.FLASH_ATTENTION]):
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, dropout_p=0, is_causal=True)
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, dropout_p=d_p, is_causal=True)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
@@ -76,11 +73,9 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        #self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.c_fc    = nn.Linear(config.n_embd, 4*config.n_embd, bias=config.bias)
         self.gelu    = nn.GELU()
-        #self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.c_proj  = nn.Linear(4*config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
@@ -104,18 +99,82 @@ class Block(nn.Module):
         x = x + self.mlp(self.ln_2(x))
         return x
 
-class Fan(nn.Module):
+class Sum_mlp(nn.Module):
 
-    def __init__(self, in_dim, out_dim):
+    def __init__(self, n, config):
         super().__init__()
-        stdv = 1. / math.sqrt(in_dim)
-        self.weight = nn.Parameter(stdv*(2*torch.rand((out_dim,in_dim))-1))
+        self.c_fc    = nn.Linear(n, 4*n, bias=config.bias)
+        self.gelu    = nn.GELU()
+        self.c_proj  = nn.Linear(4*n, 1, bias=config.bias)
+        self.dropout = nn.Dropout(config.dropout)
+        #print("init sum_mlp", n)
+        self.n = n
 
     def forward(self, x):
-        return nn.functional.linear(x, self.weight)
+        #print("self.n",self.n)
+        x = self.c_fc(x)
+        x = self.gelu(x)
+        x = self.c_proj(x)
+        x = self.dropout(x)
+        x = torch.squeeze(x,dim=-1)
+        return x
 
-    def backward(self, x):
-        return nn.functional.linear(x, self.weight.T)
+class Summary(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.K = config.summary_points
+        self.K_s = self.K
+        self.spans = np.zeros(self.K,dtype = int)
+
+        #exponential growth of summary chunks
+        base = math.pow(config.block_size, 1/self.K)
+        for i in range(1,self.K): self.spans[i] = config.block_size - math.pow(base,self.K - i)
+
+
+        for i in range(1,self.K):
+            if self.spans[i] <= self.spans[i-1]+1:
+                self.K = i + (config.block_size - self.spans[i-1]-1)
+                self.K_s = i
+                self.spans = self.spans[:self.K]
+                self.spans[i:self.K] = np.arange(self.spans[i-1]+1,config.block_size)
+                break
+        self.uq = np.unique(self.spans[1:self.K_s]- self.spans[0:self.K_s-1])  #find unique spans
+        self.loc = np.zeros((self.spans[1]-self.spans[0]),dtype = int)
+        print("spans: multiples", self.K_s, "total points", self.K, "block_size", config.block_size, self.spans)
+        print("uniques",self.uq.size, self.uq)
+
+        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.s = nn.ModuleList([Sum_mlp(self.uq[i],config) for i in range(self.uq.size)]) #summarizers for unique spans
+        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        self.config = config
+
+
+    def forward(self,x,s_flag):
+
+        if s_flag: #summary mode
+            x = self.ln_1(x)
+            y = torch.zeros((x.size(0),x.size(2),self.K), dtype=x.dtype, device=x.device)
+            x = x.transpose(1,2)
+
+            #construct summaries
+            for i in range(self.K_s - 1):
+                #print(self.spans[i], self.spans[i+1])
+                j=np.squeeze(np.argwhere(self.uq==(self.spans[i+1]-self.spans[i])))
+                y[...,i] = self.s[j](x[...,self.spans[i]:self.spans[i+1]])
+
+            #print(self.spans[-(self.K-self.K_s+1):])
+            y[...,-(self.K-self.K_s+1):] = x[...,-(self.K-self.K_s+1):] # singletons
+            y = y.transpose(1,2)
+            y = self.ln_2(y)
+            #print(x.shape, y.shape)
+
+        else:# support point mode for validation
+            #print(self.spans[1:-(self.K-self.K_s)]-1)
+            #print(self.spans[-(self.K-self.K_s+1):])
+            y = torch.cat((x[:,self.spans[1:-(self.K-self.K_s)]-1],x[:,-(self.K-self.K_s+1):]), dim =1)
+            #print(x.shape, y.shape)
+        return y
 
 
 @dataclass
@@ -127,8 +186,7 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-    n_shard: int = 1
-    r_ratio: int = 1
+    summary_points: int = 0
 
 class GPT(nn.Module):
 
@@ -137,24 +195,25 @@ class GPT(nn.Module):
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
-        self.r_embd = int(config.n_shard*config.n_embd/config.r_ratio)
 
         self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, self.r_embd),
-            wpe = nn.Embedding(config.block_size, config.n_shard*config.n_embd),
+            wte = nn.Embedding(config.vocab_size, config.n_embd),
+            wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            m = nn.ModuleList([MLP(config) for _ in range(config.n_shard)]),   #stride
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
 
-        self.fan = Fan(self.r_embd, config.n_shard*config.n_embd)
-        self.lm_head = nn.Linear(self.r_embd, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+
+        if self.config.summary_points>0:
+            self.summary = Summary(config)
+            print('running summary')
 
         # init all weights
         self.apply(self._init_weights)
@@ -191,35 +250,34 @@ class GPT(nn.Module):
         device = idx.device
         b, t = idx.size()
 
-
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0,t, dtype=torch.long, device=device)
 
-
         # forward the GPT model itself
-        tok_emb = self.fan.forward(self.transformer.wte(idx)) # fan out low-rank token embeddings
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape
+        tok_emb = (self.transformer.wte(idx)) # token embeddings
+        pos_emb = self.transformer.wpe(pos) # position embeddings
+        x = self.transformer.drop(tok_emb + pos_emb)
+        if self.config.summary_points: x=self.summary(x, True) # construct summaries
 
-        # sharded transformer
-        x0 = self.transformer.drop(tok_emb + pos_emb)
-        x=x0[...,0:self.config.n_embd]
-        x = self.transformer.m[0](x)
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
-        for i in range(1,self.config.n_shard):
-            x1 = x0[...,i*self.config.n_embd:(i+1)*self.config.n_embd]
-            x1 = self.transformer.m[i](x1)
-            for block in self.transformer.h:
-                x1 = block(x1)
-            x1 = self.transformer.ln_f(x1)
-            x = torch.cat((x1,x),dim=-1)
-
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(self.fan.backward(x)) # fan in then decode
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            logits = self.lm_head(x)
+            if not self.training:
+                #check only last position for validation
+                loss = F.cross_entropy(logits[:,-1,:], targets[:,-1], ignore_index=-1)
+            elif self.config.summary_points==0:
+                # no summary, check all positions
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            else:
+                #summary on, check summary positions and last position
+                targets =self.summary(targets, False)
+                #loss = F.cross_entropy(logits, targets, ignore_index=-1)
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
