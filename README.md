@@ -1,5 +1,6 @@
 
 This is a modification of karpathy's nanoGPT for Recurrent Transformers
+
 blame: bnkausik@gmail.com
 June 23 2025
 
